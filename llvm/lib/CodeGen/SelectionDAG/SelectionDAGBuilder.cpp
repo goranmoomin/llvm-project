@@ -5539,7 +5539,7 @@ SDValue SelectionDAGBuilder::handleTargetIntrinsicRet(const CallBase &I,
     // Insert `assertalign` node if there's an alignment.
     Result = DAG.getAssertAlign(getCurSDLoc(), Result, Alignment.valueOrOne());
   } else if (!isa<VectorType>(I.getType())) {
-    Result = lowerRangeToAssertZExt(DAG, I, Result);
+    Result = lowerRangeToAssertion(DAG, I, Result);
   }
 
   return Result;
@@ -9396,7 +9396,7 @@ void SelectionDAGBuilder::LowerCallTo(const CallBase &CB, SDValue Callee,
   std::pair<SDValue, SDValue> Result = lowerInvokable(CLI, EHPadBB);
 
   if (Result.first.getNode()) {
-    Result.first = lowerRangeToAssertZExt(DAG, CB, Result.first);
+    Result.first = lowerRangeToAssertion(DAG, CB, Result.first);
     Result.first = lowerNoFPClassToAssertNoFPClass(DAG, CB, Result.first);
     setValue(&CB, Result.first);
   }
@@ -10981,31 +10981,49 @@ void SelectionDAGBuilder::visitVACopy(const CallInst &I) {
                           DAG.getSrcValue(I.getArgOperand(1))));
 }
 
-SDValue SelectionDAGBuilder::lowerRangeToAssertZExt(SelectionDAG &DAG,
-                                                    const Instruction &I,
-                                                    SDValue Op) {
-  std::optional<ConstantRange> CR = getRange(I);
+/// If \p CR proves that a value of type \p VT is a zero- or sign-extension
+/// of a narrower integer type, return the assert opcode and that narrower
+/// type. On a tie, the zero-extension is preferred.
+static std::optional<std::pair<ISD::NodeType, EVT>>
+getRangeAssertInfo(LLVMContext &Ctx, const ConstantRange &CR, EVT VT) {
+  if (!VT.isScalarInteger() || CR.isFullSet() || CR.isEmptySet())
+    return std::nullopt;
+  constexpr unsigned MinBits = IntegerType::MIN_INT_BITS;
+  unsigned ZextBits =
+      std::max(CR.getUnsignedMax().getActiveBits(), MinBits);
+  unsigned SextBits = std::max({CR.getSignedMax().getSignificantBits(),
+                                CR.getSignedMin().getSignificantBits(),
+                                MinBits});
+  unsigned AssertBits = std::min(ZextBits, SextBits);
+  if (AssertBits >= VT.getSizeInBits())
+    return std::nullopt;
+  ISD::NodeType Opc = ZextBits <= SextBits ? ISD::AssertZext : ISD::AssertSext;
+  return std::make_pair(Opc, EVT::getIntegerVT(Ctx, AssertBits));
+}
 
-  if (!CR || CR->isFullSet() || CR->isEmptySet() || CR->isUpperWrapped())
+SDValue SelectionDAGBuilder::lowerRangeToAssertion(SelectionDAG &DAG,
+                                                   const Instruction &I,
+                                                   SDValue Op) {
+  std::optional<ConstantRange> CR = getRange(I);
+  if (!CR)
     return Op;
 
-  APInt Hi = CR->getUnsignedMax();
-  unsigned Bits = std::max(Hi.getActiveBits(),
-                           static_cast<unsigned>(IntegerType::MIN_INT_BITS));
-
-  EVT SmallVT = EVT::getIntegerVT(*DAG.getContext(), Bits);
+  auto Assertion =
+      getRangeAssertInfo(*DAG.getContext(), *CR, Op.getValueType());
+  if (!Assertion)
+    return Op;
 
   SDLoc SL = getCurSDLoc();
 
-  SDValue ZExt = DAG.getNode(ISD::AssertZext, SL, Op.getValueType(), Op,
-                             DAG.getValueType(SmallVT));
+  SDValue Assert = DAG.getNode(Assertion->first, SL, Op.getValueType(), Op,
+                               DAG.getValueType(Assertion->second));
   unsigned NumVals = Op.getNode()->getNumValues();
   if (NumVals == 1)
-    return ZExt;
+    return Assert;
 
   SmallVector<SDValue, 4> Ops;
 
-  Ops.push_back(ZExt);
+  Ops.push_back(Assert);
   for (unsigned I = 1; I != NumVals; ++I)
     Ops.push_back(Op.getValue(I));
 
@@ -12329,6 +12347,15 @@ void SelectionDAGISel::LowerArguments(const Function &F) {
           OutVal = DAG.getNode(ISD::AssertNoFPClass, dl, OutVal.getValueType(),
                                OutVal, SDNoFPClass);
         }
+
+        // If a range attribute shows that the value fits in fewer bits,
+        // assert that it is a zero- or sign-extension of that narrower
+        // width, making the range visible to DAG known-bits analysis.
+        if (std::optional<ConstantRange> CR = Arg.getRange())
+          if (auto Assertion =
+                  getRangeAssertInfo(*CurDAG->getContext(), *CR, VT))
+            OutVal = DAG.getNode(Assertion->first, dl, VT, OutVal,
+                                 DAG.getValueType(Assertion->second));
         ArgValues.push_back(OutVal);
       }
 
@@ -12365,7 +12392,8 @@ void SelectionDAGISel::LowerArguments(const Function &F) {
     }
 
     // Analyses past this point are naive and don't expect an assertion.
-    if (Res.getOpcode() == ISD::AssertZext)
+    while (Res.getOpcode() == ISD::AssertZext ||
+           Res.getOpcode() == ISD::AssertSext)
       Res = Res.getOperand(0);
 
     // Update the SwiftErrorVRegDefMap.

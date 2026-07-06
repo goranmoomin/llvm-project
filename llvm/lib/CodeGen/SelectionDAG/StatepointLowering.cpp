@@ -1172,7 +1172,7 @@ void SelectionDAGBuilder::LowerCallSiteWithDeoptBundleImpl(
 
   LLVM_DEBUG(dbgs() << "Lowering call with deopt bundle " << *Call << "\n");
   if (SDValue ReturnVal = LowerAsSTATEPOINT(SI)) {
-    ReturnVal = lowerRangeToAssertZExt(DAG, *Call, ReturnVal);
+    ReturnVal = lowerRangeToAssertion(DAG, *Call, ReturnVal);
     setValue(Call, ReturnVal);
   }
 }

@@ -425,10 +425,10 @@ public:
   // not iterate over the call arguments.
   bool canTailCall(const CallBase &CB) const;
 
-  // Lower range metadata from 0 to N to assert zext to an integer of nearest
-  // floor power of two.
-  SDValue lowerRangeToAssertZExt(SelectionDAG &DAG, const Instruction &I,
-                                 SDValue Op);
+  // Lower a range attribute or metadata on a call result to an AssertZext
+  // or AssertSext of the narrowest width containing the range.
+  SDValue lowerRangeToAssertion(SelectionDAG &DAG, const Instruction &I,
+                                SDValue Op);
 
   // Lower nofpclass attributes to AssertNoFPClass
   SDValue lowerNoFPClassToAssertNoFPClass(SelectionDAG &DAG,
