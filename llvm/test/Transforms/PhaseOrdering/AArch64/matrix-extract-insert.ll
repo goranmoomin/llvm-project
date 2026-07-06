@@ -85,14 +85,14 @@ define void @matrix_extract_insert_loop(i32 %i, ptr nonnull align 8 dereferencea
 ; CHECK-NEXT:  entry:
 ; CHECK-NEXT:    [[CMP210_NOT:%.*]] = icmp eq i32 [[I:%.*]], 0
 ; CHECK-NEXT:    [[CONV6:%.*]] = zext i32 [[I]] to i64
+; CHECK-NEXT:    [[TMP2:%.*]] = icmp ult i32 [[I]], 225
+; CHECK-NEXT:    call void @llvm.assume(i1 [[TMP2]])
 ; CHECK-NEXT:    br i1 [[CMP210_NOT]], label [[FOR_COND_CLEANUP:%.*]], label [[VECTOR_MEMCHECK:%.*]]
 ; CHECK:       for.cond1.preheader.preheader:
 ; CHECK-NEXT:    [[TMP0:%.*]] = shl nuw nsw i64 [[CONV6]], 3
 ; CHECK-NEXT:    [[TMP1:%.*]] = add nuw nsw i64 [[TMP0]], 360
 ; CHECK-NEXT:    [[SCEVGEP:%.*]] = getelementptr i8, ptr [[B:%.*]], i64 [[TMP1]]
 ; CHECK-NEXT:    [[SCEVGEP20:%.*]] = getelementptr i8, ptr [[A:%.*]], i64 [[TMP1]]
-; CHECK-NEXT:    [[TMP2:%.*]] = icmp ult i32 [[I]], 225
-; CHECK-NEXT:    tail call void @llvm.assume(i1 [[TMP2]])
 ; CHECK-NEXT:    [[TMP3:%.*]] = getelementptr inbounds nuw [8 x i8], ptr [[B]], i64 [[CONV6]]
 ; CHECK-NEXT:    [[MIN_ITERS_CHECK:%.*]] = icmp samesign ult i32 [[I]], 4
 ; CHECK-NEXT:    br i1 [[MIN_ITERS_CHECK]], label [[FOR_BODY4_US_PREHEADER:%.*]], label [[FOR_COND1_PREHEADER_US_PREHEADER:%.*]]

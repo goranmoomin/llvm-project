@@ -13,6 +13,8 @@ define void @skip_one_sided_assume(i32 %x) {
 ; CHECK-SAME: i32 [[X:%.*]]) {
 ; CHECK-NEXT:  [[ENTRY:.*:]]
 ; CHECK-NEXT:    [[C0:%.*]] = icmp eq i32 [[X]], 0
+; CHECK-NEXT:    [[TMP0:%.*]] = icmp ult i32 [[X]], 2
+; CHECK-NEXT:    call void @llvm.assume(i1 [[TMP0]])
 ; CHECK-NEXT:    [[T0:%.*]] = call i1 @cond()
 ; CHECK-NEXT:    br i1 [[C0]], label %[[IF0:.*]], label %[[ELSE:.*]]
 ; CHECK:       [[IF0]]:
@@ -21,8 +23,6 @@ define void @skip_one_sided_assume(i32 %x) {
 ; CHECK-NEXT:    call void @f()
 ; CHECK-NEXT:    br label %[[EXIT]]
 ; CHECK:       [[ELSE]]:
-; CHECK-NEXT:    [[C1:%.*]] = icmp eq i32 [[X]], 1
-; CHECK-NEXT:    call void @llvm.assume(i1 [[C1]])
 ; CHECK-NEXT:    br i1 [[T0]], label %[[CALLG:.*]], label %[[EXIT]]
 ; CHECK:       [[CALLG]]:
 ; CHECK-NEXT:    call void @g()
@@ -238,6 +238,55 @@ a:
 b:
   %t1 = call i1 @cond()
   call void @g()
+  ret void
+}
+
+; Same as @skip_one_sided_assume, but the branch is on an unrelated i1, so
+; the entry-block assume hoisting does not fire and the skip logic in
+; hoistCommonCodeFromSuccessors is exercised.
+define void @skip_one_sided_assume_i1_branch(i1 %c, i32 %x) {
+; CHECK-LABEL: define void @skip_one_sided_assume_i1_branch(
+; CHECK-SAME: i1 [[C:%.*]], i32 [[X:%.*]]) {
+; CHECK-NEXT:  [[ENTRY:.*:]]
+; CHECK-NEXT:    [[T0:%.*]] = call i1 @cond()
+; CHECK-NEXT:    br i1 [[C]], label %[[IF0:.*]], label %[[ELSE:.*]]
+; CHECK:       [[IF0]]:
+; CHECK-NEXT:    br i1 [[T0]], label %[[CALLF:.*]], label %[[EXIT:.*]]
+; CHECK:       [[CALLF]]:
+; CHECK-NEXT:    call void @f()
+; CHECK-NEXT:    br label %[[EXIT]]
+; CHECK:       [[ELSE]]:
+; CHECK-NEXT:    [[C1:%.*]] = icmp eq i32 [[X]], 1
+; CHECK-NEXT:    call void @llvm.assume(i1 [[C1]])
+; CHECK-NEXT:    br i1 [[T0]], label %[[CALLG:.*]], label %[[EXIT]]
+; CHECK:       [[CALLG]]:
+; CHECK-NEXT:    call void @g()
+; CHECK-NEXT:    br label %[[EXIT]]
+; CHECK:       [[EXIT]]:
+; CHECK-NEXT:    ret void
+;
+entry:
+  br i1 %c, label %if0, label %else
+
+if0:
+  %t0 = call i1 @cond()
+  br i1 %t0, label %callf, label %exit
+
+callf:
+  call void @f()
+  br label %exit
+
+else:
+  %c1 = icmp eq i32 %x, 1
+  call void @llvm.assume(i1 %c1)
+  %t1 = call i1 @cond()
+  br i1 %t1, label %callg, label %exit
+
+callg:
+  call void @g()
+  br label %exit
+
+exit:
   ret void
 }
 

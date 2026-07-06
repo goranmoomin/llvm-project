@@ -305,6 +305,7 @@ class SimplifyCFGOpt {
                                                    SelectInst *Select,
                                                    IRBuilder<> &Builder);
   bool hoistCommonCodeFromSuccessors(Instruction *TI, bool AllInstsEqOnly);
+  bool hoistEntryBlockArgAssumes(CondBrInst *BI, IRBuilder<> &Builder);
   bool hoistSuccIdenticalTerminatorToSwitchOrIf(
       Instruction *TI, Instruction *I1,
       SmallVectorImpl<Instruction *> &OtherSuccTIs,
@@ -8687,6 +8688,106 @@ static bool mergeNestedCondBranch(CondBrInst *BI, DomTreeUpdater *DTU) {
   return true;
 }
 
+/// If the entry block ends in a conditional branch on an icmp of an argument
+/// against a constant and a successor having the entry block as its only
+/// predecessor contains guaranteed-to-execute llvm.assume calls over icmps of
+/// the same argument, hoist those assumes into the entry block, weakened with
+/// the branch condition: assume(A) guarded by C becomes assume(!C | A)
+/// (assume(C | A) on the false edge), emitted as a single equivalent icmp of
+/// the union of the two ranges. Semantically no information is lost because
+/// the branch remains (the weakened assume together with the edge condition
+/// implies the original fact), though recovering it requires an analysis
+/// that chains both conditions, such as LVI. In exchange, entry-block
+/// assumes on arguments can be promoted to range parameter attributes.
+bool SimplifyCFGOpt::hoistEntryBlockArgAssumes(CondBrInst *BI,
+                                               IRBuilder<> &Builder) {
+  // Match an icmp between an integer argument and a constant, returning the
+  // argument and the exact range of argument values making it true.
+  auto MatchArgICmpConst =
+      [](Value *V) -> std::optional<std::pair<Argument *, ConstantRange>> {
+    CmpPredicate Pred;
+    Value *Op;
+    const APInt *C;
+    if (match(V, m_ICmp(Pred, m_Value(Op), m_APInt(C)))) {
+      if (auto *Arg = dyn_cast<Argument>(Op))
+        return std::make_pair(Arg,
+                              ConstantRange::makeExactICmpRegion(Pred, *C));
+    } else if (match(V, m_ICmp(Pred, m_APInt(C), m_Value(Op)))) {
+      if (auto *Arg = dyn_cast<Argument>(Op))
+        return std::make_pair(
+            Arg, ConstantRange::makeExactICmpRegion(
+                     ICmpInst::getSwappedPredicate(Pred), *C));
+    }
+    return std::nullopt;
+  };
+
+  BasicBlock *BB = BI->getParent();
+  // Only hoist when the branch also tests the assumed argument, so that the
+  // weakened assume is a single range check on the argument, promotable to a
+  // range parameter attribute. Otherwise we would just accumulate clutter
+  // and inhibit block speculation.
+  auto BranchCmp = MatchArgICmpConst(BI->getCondition());
+  if (!BranchCmp)
+    return false;
+  auto [BranchArg, BranchCR] = *BranchCmp;
+  bool Changed = false;
+  for (unsigned SuccIdx = 0; SuccIdx != 2; ++SuccIdx) {
+    BasicBlock *Succ = BI->getSuccessor(SuccIdx);
+    if (Succ->getSinglePredecessor() != BB)
+      continue;
+    // Values of the argument for which this successor can be entered.
+    ConstantRange GuardCR = SuccIdx == 0 ? BranchCR : BranchCR.inverse();
+    SmallVector<std::pair<AssumeInst *, ConstantRange>, 2> Assumes;
+    for (Instruction &I : *Succ) {
+      if (I.isTerminator())
+        break;
+      if (auto *A = dyn_cast<AssumeInst>(&I)) {
+        if (!A->hasOperandBundles())
+          if (auto R = MatchArgICmpConst(A->getArgOperand(0)))
+            if (R->first == BranchArg)
+              Assumes.push_back({A, R->second});
+        continue;
+      }
+      // The assume must execute whenever the successor is entered.
+      if (!isGuaranteedToTransferExecutionToSuccessor(&I))
+        break;
+    }
+    for (auto &[A, AssumeCR] : Assumes) {
+      // If the edge condition already implies the assumed range, the assume
+      // adds no information; just delete it.
+      if (AssumeCR.contains(GuardCR)) {
+        Value *OldCond = A->getArgOperand(0);
+        A->eraseFromParent();
+        RecursivelyDeleteTriviallyDeadInstructions(OldCond);
+        Changed = true;
+        continue;
+      }
+      // The weakened fact: either the branch went the other way, or the
+      // assumed range holds.
+      ConstantRange Union = GuardCR.inverse().unionWith(AssumeCR);
+      CmpInst::Predicate Pred;
+      APInt RHS;
+      // unionWith may over-approximate. Only hoist if the weakened fact
+      // together with the edge condition still implies the assumed range,
+      // so that deleting the original assume loses no information.
+      if (Union.isFullSet() ||
+          !AssumeCR.contains(Union.intersectWith(GuardCR)) ||
+          !Union.getEquivalentICmp(Pred, RHS))
+        continue;
+      Value *OldCond = A->getArgOperand(0);
+      Builder.SetInsertPoint(BI);
+      CallInst *NewAssume = Builder.CreateAssumption(Builder.CreateICmp(
+          Pred, BranchArg, ConstantInt::get(BranchArg->getType(), RHS)));
+      if (Options.AC)
+        Options.AC->registerAssumption(cast<AssumeInst>(NewAssume));
+      A->eraseFromParent();
+      RecursivelyDeleteTriviallyDeadInstructions(OldCond);
+      Changed = true;
+    }
+  }
+  return Changed;
+}
+
 bool SimplifyCFGOpt::simplifyCondBranch(CondBrInst *BI, IRBuilder<> &Builder) {
   assert(
       !isa<ConstantInt>(BI->getCondition()) &&
@@ -8723,6 +8824,11 @@ bool SimplifyCFGOpt::simplifyCondBranch(CondBrInst *BI, IRBuilder<> &Builder) {
   // Try to turn "br (X == 0 | X == 1), T, F" into a switch instruction.
   if (simplifyBranchOnICmpChain(BI, Builder, DL))
     return true;
+
+  // Hoist argument assumes from the successors into the entry block, where
+  // they can be promoted to parameter attributes.
+  if (BB->isEntryBlock() && hoistEntryBlockArgAssumes(BI, Builder))
+    return requestResimplify();
 
   // If this basic block has dominating predecessor blocks and the dominating
   // blocks' conditions imply BI's condition, we know the direction of BI.
