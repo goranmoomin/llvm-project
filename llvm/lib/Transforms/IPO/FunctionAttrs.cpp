@@ -2193,6 +2193,115 @@ static void addWillReturn(const SCCNodeSet &SCCNodes,
   }
 }
 
+/// Match an icmp between an integer argument and a constant, returning the
+/// argument and the exact range of argument values making it true.
+/// Keep in sync with the MatchArgICmpConst lambda in SimplifyCFG's
+/// hoistEntryBlockArgAssumes, which produces the assumes promoted here.
+static std::optional<std::pair<Argument *, ConstantRange>>
+matchArgICmpConst(Value *V) {
+  CmpPredicate Pred;
+  Value *Op;
+  const APInt *C;
+  if (match(V, m_ICmp(Pred, m_Value(Op), m_APInt(C)))) {
+    if (auto *Arg = dyn_cast<Argument>(Op))
+      return std::make_pair(Arg, ConstantRange::makeExactICmpRegion(Pred, *C));
+  } else if (match(V, m_ICmp(Pred, m_APInt(C), m_Value(Op)))) {
+    if (auto *Arg = dyn_cast<Argument>(Op))
+      return std::make_pair(Arg,
+                            ConstantRange::makeExactICmpRegion(
+                                ICmpInst::getSwappedPredicate(Pred), *C));
+  }
+  return std::nullopt;
+}
+
+/// Match a condition that constrains a single integer argument to a constant
+/// range: an icmp of the argument against a constant, or a disjunction of
+/// such icmps over the same argument. The disjunctive case may
+/// over-approximate, since the union of two ranges is not always exactly
+/// representable (e.g. x == 0 || x == 10 gives [0, 11)). The recursion depth
+/// is bounded.
+static std::optional<std::pair<Argument *, ConstantRange>>
+matchArgRangeCondition(Value *V, unsigned Depth = 0) {
+  constexpr unsigned MaxDepth = 6;
+  if (Depth >= MaxDepth)
+    return std::nullopt;
+  Value *A, *B;
+  if (match(V, m_LogicalOr(m_Value(A), m_Value(B)))) {
+    auto RA = matchArgRangeCondition(A, Depth + 1);
+    if (!RA)
+      return std::nullopt;
+    auto RB = matchArgRangeCondition(B, Depth + 1);
+    if (!RB || RA->first != RB->first)
+      return std::nullopt;
+    return std::make_pair(RA->first, RA->second.unionWith(RB->second));
+  }
+  return matchArgICmpConst(V);
+}
+
+/// Infer range attributes on the parameters of F constrained by a single
+/// guaranteed-to-execute entry-block assume. Returns true if an attribute
+/// was added.
+static bool addRangeAttrsFromOneAssume(Function &F, AssumeInst &Assume) {
+  bool AddedAttrs = false;
+  // Split top-level conjunctions into separate facts.
+  SmallVector<Value *, 4> Worklist;
+  Worklist.push_back(Assume.getArgOperand(0));
+  while (!Worklist.empty()) {
+    Value *V = Worklist.pop_back_val();
+    Value *A, *B;
+    if (match(V, m_LogicalAnd(m_Value(A), m_Value(B)))) {
+      Worklist.push_back(A);
+      Worklist.push_back(B);
+      continue;
+    }
+    auto R = matchArgRangeCondition(V);
+    if (!R)
+      continue;
+    auto [Arg, CR] = *R;
+    if (CR.isFullSet() || CR.isEmptySet())
+      continue;
+    if (std::optional<ConstantRange> OldCR = Arg->getRange()) {
+      CR = CR.intersectWith(*OldCR);
+      if (CR == *OldCR || CR.isEmptySet())
+        continue;
+    }
+    F.addParamAttr(Arg->getArgNo(),
+                   Attribute::get(F.getContext(), Attribute::Range, CR));
+    AddedAttrs = true;
+  }
+  return AddedAttrs;
+}
+
+/// Promote llvm.assume calls in the entry block that are guaranteed to
+/// execute and constrain an integer argument to a constant range into range
+/// attributes on the corresponding parameter. Attaching the attribute is
+/// sound: violating it yields poison, and the same out-of-range values
+/// triggered UB via the assume before. When the assumed condition is exactly
+/// representable as a range (in particular the single-icmp assumes produced
+/// by SimplifyCFG's entry-block hoisting), the assume becomes redundant and
+/// is cleaned up by later passes, so the information no longer inhibits
+/// transforms that must treat assumes conservatively. Over-approximated
+/// disjunctions keep their assume and only gain the weaker attribute.
+static void addRangeAttrsFromAssumes(const SCCNodeSet &SCCNodes,
+                                     SmallPtrSet<Function *, 8> &Changed) {
+  for (Function *F : SCCNodes) {
+    if (!F || !F->hasExactDefinition())
+      continue;
+    for (Instruction &I : F->getEntryBlock()) {
+      if (auto *Assume = dyn_cast<AssumeInst>(&I)) {
+        if (!Assume->hasOperandBundles() &&
+            addRangeAttrsFromOneAssume(*F, *Assume))
+          Changed.insert(F);
+        continue;
+      }
+      // Facts below this point are no longer guaranteed to hold on every
+      // execution of the function.
+      if (!isGuaranteedToTransferExecutionToSuccessor(&I))
+        break;
+    }
+  }
+}
+
 static SCCNodesResult createSCCNodeSet(ArrayRef<Function *> Functions) {
   SCCNodesResult Res;
   for (Function *F : Functions) {
@@ -2223,6 +2332,7 @@ deriveAttrsInPostOrder(ArrayRef<Function *> Functions, AARGetterT &&AARGetter,
     // on the *current* function. "initializes" attribute is to aid
     // optimizations (like DSE) on the callers, so skip "initializes" here.
     addArgumentAttrs(Nodes.SCCNodes, Changed, /*SkipInitializes=*/true);
+    addRangeAttrsFromAssumes(Nodes.SCCNodes, Changed);
     return Changed;
   }
 
@@ -2236,6 +2346,7 @@ deriveAttrsInPostOrder(ArrayRef<Function *> Functions, AARGetterT &&AARGetter,
   addNoUndefAttrs(Nodes.SCCNodes, Changed);
   addNoAliasAttrs(Nodes.SCCNodes, Changed);
   addNonNullAttrs(Nodes.SCCNodes, Changed);
+  addRangeAttrsFromAssumes(Nodes.SCCNodes, Changed);
   inferAttrsFromFunctionBodies(Nodes.SCCNodes, Changed);
   addNoRecurseAttrs(Nodes.SCCNodes, Changed);
 

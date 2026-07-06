@@ -238,7 +238,7 @@ declare void @llvm.assume(i1)
 ; FIXME: missing nonnull
 define ptr @test10(ptr %a, i64 %n) {
 ; FNATTRS-LABEL: define ptr @test10(
-; FNATTRS-SAME: ptr nofree readnone captures(ret: address, provenance) [[A:%.*]], i64 [[N:%.*]]) #[[ATTR3:[0-9]+]] {
+; FNATTRS-SAME: ptr nofree readnone captures(ret: address, provenance) [[A:%.*]], i64 range(i64 1, 0) [[N:%.*]]) #[[ATTR3:[0-9]+]] {
 ; FNATTRS-NEXT:    [[CMP:%.*]] = icmp ne i64 [[N]], 0
 ; FNATTRS-NEXT:    call void @llvm.assume(i1 [[CMP]])
 ; FNATTRS-NEXT:    [[B:%.*]] = getelementptr inbounds i8, ptr [[A]], i64 [[N]]

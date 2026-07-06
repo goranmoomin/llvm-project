@@ -8703,6 +8703,8 @@ bool SimplifyCFGOpt::hoistEntryBlockArgAssumes(CondBrInst *BI,
                                                IRBuilder<> &Builder) {
   // Match an icmp between an integer argument and a constant, returning the
   // argument and the exact range of argument values making it true.
+  // Keep in sync with matchArgICmpConst in FunctionAttrs, which promotes
+  // the assumes hoisted here to range parameter attributes.
   auto MatchArgICmpConst =
       [](Value *V) -> std::optional<std::pair<Argument *, ConstantRange>> {
     CmpPredicate Pred;
