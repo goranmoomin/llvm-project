@@ -1532,6 +1532,13 @@ static unsigned skippedInstrFlags(Instruction *I) {
   // Pseudo probes don't constrain reordering of other instructions.
   if (isa<PseudoProbeInst>(I))
     return 0;
+  // Neither do bundle-less assumes: if the condition is false, execution hits
+  // immediate UB at the assume no matter what is reordered across it. Assumes
+  // with operand bundles are point facts, so reordering other instructions
+  // across them is not generally valid.
+  if (auto *Assume = dyn_cast<AssumeInst>(I))
+    if (!Assume->hasOperandBundles())
+      return 0;
   unsigned Flags = 0;
   if (I->mayReadFromMemory())
     Flags |= SkipReadMem;
@@ -1581,6 +1588,34 @@ static bool isSafeToHoistInstr(Instruction *I, unsigned Flags) {
 }
 
 static bool passingValueIsAlwaysUndefined(Value *V, Instruction *I, bool PtrValueMayBeModified = false);
+
+namespace {
+/// Track ephemeral values, which should be ignored for cost-modelling
+/// purposes. Requires walking instructions in reverse order.
+class EphemeralValueTracker {
+  SmallPtrSet<const Instruction *, 32> EphValues;
+
+  bool isEphemeral(const Instruction *I) {
+    if (isa<AssumeInst>(I))
+      return true;
+    return !I->mayHaveSideEffects() && !I->isTerminator() &&
+           all_of(I->users(), [&](const User *U) {
+             return EphValues.count(cast<Instruction>(U));
+           });
+  }
+
+public:
+  bool track(const Instruction *I) {
+    if (isEphemeral(I)) {
+      EphValues.insert(I);
+      return true;
+    }
+    return false;
+  }
+
+  bool contains(const Instruction *I) const { return EphValues.contains(I); }
+};
+} // namespace
 
 /// Helper function for hoistCommonCodeFromSuccessors. Return true if identical
 /// instructions \p I1 and \p I2 can and should be hoisted.
@@ -1949,6 +1984,26 @@ bool SimplifyCFGOpt::hoistCommonCodeFromSuccessors(Instruction *TI,
 
   bool Changed = false;
 
+  // Collect ephemeral values (assumes and instructions only used by assumes)
+  // in the successors. They do not need to line up across successors: they
+  // can be skipped individually, staying behind, so the remaining instruction
+  // streams realign. Only pay for tracking in blocks that contain assumes.
+  EphemeralValueTracker EphTracker;
+  for (auto &SuccIterPair : SuccIterPairs) {
+    BasicBlock *Succ = SuccIterPair.first->getParent();
+    if (any_of(*Succ, IsaPred<AssumeInst>))
+      for (Instruction &I : reverse(*Succ))
+        EphTracker.track(&I);
+  }
+  // Returns true if I may be skipped individually to realign the successors.
+  // Assumes with operand bundles are point facts, so they must line up like
+  // any other instruction.
+  auto IsSkippableEphemeral = [&](const Instruction *I) {
+    if (auto *Assume = dyn_cast<AssumeInst>(I))
+      return !Assume->hasOperandBundles();
+    return EphTracker.contains(I);
+  };
+
   for (;;) {
     auto *SuccIterPairBegin = SuccIterPairs.begin();
     auto &BB1ItrPair = *SuccIterPairBegin++;
@@ -2055,10 +2110,18 @@ bool SimplifyCFGOpt::hoistCommonCodeFromSuccessors(Instruction *TI,
         hoistLockstepIdenticalDbgVariableRecords(TI, I1, OtherInsts);
         return Changed;
       }
-      // We are about to skip over a pair of non-identical instructions. Record
-      // if any have characteristics that would prevent reordering instructions
-      // across them.
+      // If some successors are at an ephemeral instruction (a bundle-less
+      // assume or a computation only used by assumes), skip over those
+      // individually so the remaining streams realign; otherwise skip one
+      // instruction in every successor. Either way the skipped instructions
+      // stay behind, so record if any have characteristics that would prevent
+      // reordering instructions across them.
+      bool AnyEphemeral = any_of(SuccIterPairs, [&](const SuccIterPair &P) {
+        return IsSkippableEphemeral(&*P.first);
+      });
       for (auto &SuccIterPair : SuccIterPairs) {
+        if (AnyEphemeral && !IsSkippableEphemeral(&*SuccIterPair.first))
+          continue;
         Instruction *I = &*SuccIterPair.first++;
         SuccIterPair.second |= skippedInstrFlags(I);
       }
@@ -2992,34 +3055,6 @@ static bool mergeCompatibleInvokes(BasicBlock *BB, DomTreeUpdater *DTU) {
 
   return Changed;
 }
-
-namespace {
-/// Track ephemeral values, which should be ignored for cost-modelling
-/// purposes. Requires walking instructions in reverse order.
-class EphemeralValueTracker {
-  SmallPtrSet<const Instruction *, 32> EphValues;
-
-  bool isEphemeral(const Instruction *I) {
-    if (isa<AssumeInst>(I))
-      return true;
-    return !I->mayHaveSideEffects() && !I->isTerminator() &&
-           all_of(I->users(), [&](const User *U) {
-             return EphValues.count(cast<Instruction>(U));
-           });
-  }
-
-public:
-  bool track(const Instruction *I) {
-    if (isEphemeral(I)) {
-      EphValues.insert(I);
-      return true;
-    }
-    return false;
-  }
-
-  bool contains(const Instruction *I) const { return EphValues.contains(I); }
-};
-} // namespace
 
 /// Determine if we can hoist sink a sole store instruction out of a
 /// conditional block.
